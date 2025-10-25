@@ -135,64 +135,136 @@ class PolymarketCollector:
                 
         return markets
     
+    def _parse_json_field(self, field: Any) -> Optional[Any]:
+        """Parse JSON field if it's a string"""
+        if isinstance(field, str):
+            try:
+                return json.loads(field)
+            except json.JSONDecodeError:
+                return None
+        return field
+    
+    def _to_float(self, value: Any) -> Optional[float]:
+        """Convert value to float, handling None and invalid values"""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+    
+    def _to_int(self, value: Any) -> Optional[int]:
+        """Convert value to int, handling None and invalid values"""
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    
+    def _parse_timestamp(self, ts_str: Any) -> Optional[str]:
+        """Parse timestamp string to ISO format"""
+        if not ts_str:
+            return None
+        if isinstance(ts_str, str):
+            return ts_str
+        return None
+    
     def parse_market_data(self, market: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse market data into database format"""
-        # Parse JSON strings if needed
-        outcome_prices = market.get('outcomePrices')
-        if isinstance(outcome_prices, str):
-            try:
-                outcome_prices = json.loads(outcome_prices)
-            except json.JSONDecodeError:
-                outcome_prices = None
+        """Parse market data into database format with all available fields"""
         
-        clob_token_ids = market.get('clobTokenIds')
-        if isinstance(clob_token_ids, str):
-            try:
-                clob_token_ids = json.loads(clob_token_ids)
-            except json.JSONDecodeError:
-                clob_token_ids = None
-        
-        outcomes = market.get('outcomes')
-        if isinstance(outcomes, str):
-            try:
-                outcomes = json.loads(outcomes)
-            except json.JSONDecodeError:
-                outcomes = None
-        
-        # Convert volume and liquidity to float
-        volume = market.get('volume')
-        liquidity = market.get('liquidity')
-        
-        try:
-            volume = float(volume) if volume else None
-        except (ValueError, TypeError):
-            volume = None
-            
-        try:
-            liquidity = float(liquidity) if liquidity else None
-        except (ValueError, TypeError):
-            liquidity = None
+        # Parse JSON fields
+        outcome_prices = self._parse_json_field(market.get('outcomePrices'))
+        outcomes = self._parse_json_field(market.get('outcomes'))
+        clob_token_ids = self._parse_json_field(market.get('clobTokenIds'))
         
         return {
+            # Core identifiers
             'condition_id': market.get('conditionId'),
             'market_slug': market.get('slug'),
             'question': market.get('question'),
             'snapshot_timestamp': datetime.now(timezone.utc).isoformat(),
+            
+            # Market status
             'active': market.get('active'),
             'closed': market.get('closed'),
             'archived': market.get('archived'),
-            'volume': volume,
-            'liquidity': liquidity,
+            'restricted': market.get('restricted'),
+            'neg_risk': market.get('negRisk', False),
+            'accepting_orders': market.get('acceptingOrders'),
+            
+            # Core metrics
+            'volume': self._to_float(market.get('volume')),
+            'liquidity': self._to_float(market.get('liquidity')),
+            'open_interest': self._to_float(market.get('openInterest')),
+            
+            # Volume breakdowns
+            'volume_24hr': self._to_float(market.get('volume24hr')),
+            'volume_1wk': self._to_float(market.get('volume1wk')),
+            'volume_1mo': self._to_float(market.get('volume1mo')),
+            'volume_1yr': self._to_float(market.get('volume1yr')),
+            
+            # CLOB-specific volumes
+            'volume_clob': self._to_float(market.get('volumeClob')),
+            'volume_24hr_clob': self._to_float(market.get('volume24hrClob')),
+            'volume_1wk_clob': self._to_float(market.get('volume1wkClob')),
+            'volume_1mo_clob': self._to_float(market.get('volume1moClob')),
+            'volume_1yr_clob': self._to_float(market.get('volume1yrClob')),
+            
+            # Liquidity metrics
+            'liquidity_num': self._to_float(market.get('liquidityNum')),
+            'liquidity_clob': self._to_float(market.get('liquidityClob')),
+            
+            # Price data
             'outcome_prices': outcome_prices,
+            'last_trade_price': self._to_float(market.get('lastTradePrice')),
+            'best_bid': self._to_float(market.get('bestBid')),
+            'best_ask': self._to_float(market.get('bestAsk')),
+            'spread': self._to_float(market.get('spread')),
+            
+            # Price changes
+            'one_hour_price_change': self._to_float(market.get('oneHourPriceChange')),
+            'one_day_price_change': self._to_float(market.get('oneDayPriceChange')),
+            'one_week_price_change': self._to_float(market.get('oneWeekPriceChange')),
+            'one_month_price_change': self._to_float(market.get('oneMonthPriceChange')),
+            
+            # Market metadata
             'outcomes': outcomes,
             'clob_token_ids': clob_token_ids,
             'market_type': market.get('marketType'),
             'category': market.get('category'),
-            'start_date': market.get('startDate'),
-            'end_date': market.get('endDate'),
-            'neg_risk': market.get('negRisk', False),
             'description': market.get('description'),
-            'image_url': market.get('image')
+            'image_url': market.get('image'),
+            'icon_url': market.get('icon'),
+            
+            # Dates
+            'start_date': self._parse_timestamp(market.get('startDate')),
+            'end_date': self._parse_timestamp(market.get('endDate')),
+            'accepting_orders_timestamp': self._parse_timestamp(market.get('acceptingOrdersTimestamp')),
+            
+            # Trading parameters
+            'order_price_min_tick_size': self._to_float(market.get('orderPriceMinTickSize')),
+            'order_min_size': self._to_float(market.get('orderMinSize')),
+            'rewards_min_size': self._to_float(market.get('rewardsMinSize')),
+            'rewards_max_spread': self._to_float(market.get('rewardsMaxSpread')),
+            
+            # Market quality metrics
+            'competitive': self._to_float(market.get('competitive')),
+            'comment_count': self._to_int(market.get('commentCount')),
+            
+            # UMA resolution
+            'uma_bond': self._to_float(market.get('umaBond')),
+            'uma_reward': self._to_float(market.get('umaReward')),
+            
+            # Flags
+            'enable_order_book': market.get('enableOrderBook'),
+            'cyom': market.get('cyom'),
+            'featured': market.get('featured'),
+            'new': market.get('new'),
+            'approved': market.get('approved'),
+            
+            # Timestamps
+            'updated_at': self._parse_timestamp(market.get('updatedAt'))
         }
     
     def store_snapshot(self, parsed_data: Dict[str, Any]) -> bool:
