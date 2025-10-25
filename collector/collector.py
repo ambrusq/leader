@@ -8,7 +8,7 @@ load_dotenv()
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import requests
 from supabase import create_client, Client
@@ -141,7 +141,7 @@ class PolymarketCollector:
             'condition_id': market.get('conditionId'),
             'market_slug': market.get('slug'),
             'question': market.get('question'),
-            'snapshot_timestamp': datetime.utcnow().isoformat(),
+            'snapshot_timestamp': datetime.now(timezone.utc).isoformat(),
             'active': market.get('active'),
             'closed': market.get('closed'),
             'archived': market.get('archived'),
@@ -219,7 +219,7 @@ def main():
         
         print(json.dumps({
             'status': 'success',
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'stats': stats
         }))
         
@@ -228,7 +228,7 @@ def main():
         print(json.dumps({
             'status': 'error',
             'error': str(e),
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }))
         exit(1)
 

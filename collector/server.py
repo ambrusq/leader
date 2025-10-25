@@ -6,13 +6,13 @@ Provides an HTTP endpoint that triggers data collection
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import logging
 
 # Import the collector
-from collector import PolymarketCollector
+from polymarket_collector import PolymarketCollector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +34,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
             self.end_headers()
             response = {
                 'status': 'healthy',
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
             self.wfile.write(json.dumps(response).encode())
             return
@@ -52,7 +52,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 
                 response = {
                     'status': 'success',
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
                     'stats': stats
                 }
                 self.wfile.write(json.dumps(response).encode())
@@ -65,7 +65,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 response = {
                     'status': 'error',
                     'error': str(e),
-                    'timestamp': datetime.utcnow().isoformat()
+                    'timestamp': datetime.now(timezone.utc).isoformat()
                 }
                 self.wfile.write(json.dumps(response).encode())
             return
@@ -81,7 +81,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                     '/health': 'Health check',
                     '/collect': 'Trigger data collection'
                 },
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.now(timezone.utc).isoformat()
             }
             self.wfile.write(json.dumps(response).encode())
             return
