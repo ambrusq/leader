@@ -1,0 +1,12 @@
+# Python
+/collector/venv
+/collector/.env
+/collector/.env.local
+
+/collector/__pycache__
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
