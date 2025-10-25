@@ -2,6 +2,7 @@
 /collector/venv
 /collector/.env
 /collector/.env.local
+/collector/markets.sql
 
 /collector/__pycache__
 

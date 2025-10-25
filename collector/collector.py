@@ -10,6 +10,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+import time
 import requests
 from supabase import create_client, Client
 
@@ -44,39 +45,74 @@ class PolymarketCollector:
             'User-Agent': 'PolymarketCollector/1.0'
         })
     
-    def get_tracked_markets(self) -> List[str]:
-        """Get list of condition IDs to track from Supabase"""
+    def get_tracked_markets(self) -> List[Dict[str, str]]:
+        """Get list of markets to track from Supabase"""
         try:
             response = self.supabase.table('polymarket_tracked_markets')\
-                .select('condition_id')\
+                .select('condition_id, market_slug')\
                 .eq('active', True)\
                 .execute()
             
-            condition_ids = [row['condition_id'] for row in response.data]
-            logger.info(f"Found {len(condition_ids)} tracked markets")
-            return condition_ids
+            markets = [{'condition_id': row['condition_id'], 'slug': row['market_slug']} 
+                      for row in response.data]
+            logger.info(f"Found {len(markets)} tracked markets")
+            return markets
         except Exception as e:
             logger.error(f"Error fetching tracked markets: {e}")
             return []
     
-    def fetch_market_data(self, condition_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch market data for a specific condition ID"""
+    def fetch_market_data(self, market_slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch market data for a specific market slug"""
         try:
-            url = f"{GAMMA_API_BASE}/markets"
-            params = {'condition_id': condition_id}
+            # Use the direct slug endpoint as shown in the reference code
+            url = f"{GAMMA_API_BASE}/markets/slug/{market_slug}"
             
-            response = self.session.get(url, params=params, timeout=10)
+            response = self.session.get(url, timeout=10)
             response.raise_for_status()
             
             data = response.json()
-            if data and len(data) > 0:
-                return data[0]  # Returns first matching market
+            if data:
+                return data
             else:
-                logger.warning(f"No data found for condition_id: {condition_id}")
+                logger.warning(f"No data found for market_slug: {market_slug}")
                 return None
                 
         except requests.RequestException as e:
-            logger.error(f"Error fetching market {condition_id}: {e}")
+            logger.error(f"Error fetching market {market_slug}: {e}")
+            return None
+    
+    def fetch_market_by_condition_id(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch market data by searching through paginated results"""
+        try:
+            offset = 0
+            limit = 100
+            max_pages = 10  # Prevent infinite loops
+            
+            for page in range(max_pages):
+                url = f"{GAMMA_API_BASE}/markets"
+                params = {'offset': offset, 'limit': limit}
+                
+                response = self.session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                
+                markets = response.json()
+                if not markets:
+                    break
+                
+                # Search for our condition_id in the markets
+                for market in markets:
+                    if market.get('conditionId') == condition_id:
+                        logger.info(f"Found market via condition_id: {market.get('slug')}")
+                        return market
+                
+                offset += limit
+                time.sleep(0.1)  # Rate limiting
+            
+            logger.warning(f"Could not find market with condition_id: {condition_id}")
+            return None
+            
+        except requests.RequestException as e:
+            logger.error(f"Error searching for market {condition_id}: {e}")
             return None
     
     def fetch_markets_by_slugs(self, slugs: List[str]) -> List[Dict[str, Any]]:
@@ -174,20 +210,26 @@ class PolymarketCollector:
         logger.info("Starting Polymarket data collection")
         
         # Get tracked markets
-        condition_ids = self.get_tracked_markets()
+        markets = self.get_tracked_markets()
         
-        if not condition_ids:
+        if not markets:
             logger.warning("No tracked markets found. Add markets to polymarket_tracked_markets table.")
             return {'success': 0, 'failed': 0, 'skipped': 0}
         
         success_count = 0
         failed_count = 0
         
-        for condition_id in condition_ids:
-            logger.info(f"Processing market: {condition_id}")
+        for market in markets:
+            market_slug = market['slug']
+            condition_id = market['condition_id']
+            logger.info(f"Processing market: {market_slug} (condition_id: {condition_id})")
             
-            # Fetch market data
-            market_data = self.fetch_market_data(condition_id)
+            # Fetch market data - try slug first, fallback to condition_id search
+            market_data = self.fetch_market_data(market_slug)
+            
+            if not market_data:
+                logger.info(f"Slug fetch failed, trying condition_id search...")
+                market_data = self.fetch_market_by_condition_id(condition_id)
             
             if not market_data:
                 failed_count += 1
@@ -204,7 +246,7 @@ class PolymarketCollector:
         stats = {
             'success': success_count,
             'failed': failed_count,
-            'total': len(condition_ids)
+            'total': len(markets)
         }
         
         logger.info(f"Collection complete: {stats}")
