@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs
 import logging
 
 # Import the collector
-from polymarket_collector import PolymarketCollector
+from collector import PolymarketCollector
 
 logging.basicConfig(
     level=logging.INFO,
