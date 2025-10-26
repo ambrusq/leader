@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Polymarket Data Collector
-Fetches market data from Polymarket Gamma API and stores in Supabase
+Enhanced Polymarket Data Collector
+Handles both individual markets and multi-market events
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,126 +14,200 @@ import time
 import requests
 from supabase import create_client, Client
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 GAMMA_API_BASE = 'https://gamma-api.polymarket.com'
 
-# Initialize Supabase client
 def get_supabase_client() -> Client:
     """Initialize and return Supabase client"""
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables")
+        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 class PolymarketCollector:
-    """Collects and stores Polymarket data"""
+    """Collects and stores Polymarket data with event support"""
     
     def __init__(self):
         self.supabase = get_supabase_client()
         self.session = requests.Session()
         self.session.headers.update({
             'Accept': 'application/json',
-            'User-Agent': 'PolymarketCollector/1.0'
+            'User-Agent': 'PolymarketCollector/2.0'
         })
     
-    def get_tracked_markets(self) -> List[Dict[str, str]]:
+    def fetch_event_data(self, event_slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch event data including all its markets"""
+        try:
+            url = f"{GAMMA_API_BASE}/events/slug/{event_slug}"
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            logger.error(f"Error fetching event {event_slug}: {e}")
+            return None
+    
+    def fetch_market_data(self, market_slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch market data for a specific market slug"""
+        try:
+            url = f"{GAMMA_API_BASE}/markets/slug/{market_slug}"
+            response = self.session.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data if data else None
+        except requests.RequestException as e:
+            logger.error(f"Error fetching market {market_slug}: {e}")
+            return None
+    
+    def get_or_create_event(self, event_data: Dict[str, Any]) -> Optional[int]:
+        """Store or update event in database and return event_id"""
+        try:
+            event_slug = event_data.get('slug')
+            if not event_slug:
+                return None
+            
+            # Check if event exists
+            existing = self.supabase.table('polymarket_events')\
+                .select('id')\
+                .eq('event_slug', event_slug)\
+                .execute()
+            
+            event_record = {
+                'event_slug': event_slug,
+                'title': event_data.get('title'),
+                'description': event_data.get('description'),
+                'category': event_data.get('category'),
+                'image_url': event_data.get('image'),
+                'icon_url': event_data.get('icon'),
+                'start_date': self._parse_timestamp(event_data.get('startDate')),
+                'end_date': self._parse_timestamp(event_data.get('endDate')),
+                'closed': event_data.get('closed', False),
+                'active': event_data.get('active', True),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            if existing.data:
+                # Update existing event
+                event_id = existing.data[0]['id']
+                self.supabase.table('polymarket_events')\
+                    .update(event_record)\
+                    .eq('id', event_id)\
+                    .execute()
+                logger.info(f"Updated event: {event_slug}")
+            else:
+                # Create new event
+                result = self.supabase.table('polymarket_events')\
+                    .insert(event_record)\
+                    .execute()
+                event_id = result.data[0]['id']
+                logger.info(f"Created event: {event_slug}")
+            
+            return event_id
+            
+        except Exception as e:
+            logger.error(f"Error managing event: {e}")
+            return None
+    
+    def sync_event_markets(self, event_slug: str) -> List[str]:
+        """
+        Fetch event data and sync all its markets to tracked_markets table.
+        Returns list of market slugs that were synced.
+        """
+        event_data = self.fetch_event_data(event_slug)
+        if not event_data:
+            logger.warning(f"Could not fetch event: {event_slug}")
+            return []
+        
+        # Store/update event
+        event_id = self.get_or_create_event(event_data)
+        if not event_id:
+            logger.warning(f"Could not create/update event: {event_slug}")
+            return []
+        
+        # Determine event type based on markets
+        markets = event_data.get('markets', [])
+        event_type = 'multi_outcome' if len(markets) > 1 else 'single'
+        
+        # Update event type
+        try:
+            self.supabase.table('polymarket_events')\
+                .update({'event_type': event_type})\
+                .eq('id', event_id)\
+                .execute()
+        except Exception as e:
+            logger.error(f"Error updating event type: {e}")
+        
+        synced_slugs = []
+        
+        # Sync each market
+        for market in markets:
+            try:
+                condition_id = market.get('conditionId')
+                market_slug = market.get('slug')
+                
+                if not condition_id or not market_slug:
+                    continue
+                
+                # Check if market already tracked
+                existing = self.supabase.table('polymarket_tracked_markets')\
+                    .select('id')\
+                    .eq('condition_id', condition_id)\
+                    .execute()
+                
+                market_record = {
+                    'condition_id': condition_id,
+                    'market_slug': market_slug,
+                    'event_id': event_id,
+                    'market_title': market.get('question'),
+                    'outcome_label': market.get('outcomes', [''])[0] if market.get('outcomes') else None,
+                    'active': True
+                }
+                
+                if existing.data:
+                    # Update existing
+                    self.supabase.table('polymarket_tracked_markets')\
+                        .update(market_record)\
+                        .eq('condition_id', condition_id)\
+                        .execute()
+                else:
+                    # Insert new
+                    self.supabase.table('polymarket_tracked_markets')\
+                        .insert(market_record)\
+                        .execute()
+                
+                synced_slugs.append(market_slug)
+                logger.info(f"Synced market: {market_slug}")
+                
+            except Exception as e:
+                logger.error(f"Error syncing market {market.get('slug')}: {e}")
+                continue
+        
+        logger.info(f"Synced {len(synced_slugs)} markets for event: {event_slug}")
+        return synced_slugs
+    
+    def get_tracked_markets(self) -> List[Dict[str, Any]]:
         """Get list of markets to track from Supabase"""
         try:
             response = self.supabase.table('polymarket_tracked_markets')\
-                .select('condition_id, market_slug')\
+                .select('condition_id, market_slug, event_id')\
                 .eq('active', True)\
                 .execute()
             
-            markets = [{'condition_id': row['condition_id'], 'slug': row['market_slug']} 
+            markets = [{'condition_id': row['condition_id'], 
+                       'slug': row['market_slug'],
+                       'event_id': row.get('event_id')} 
                       for row in response.data]
             logger.info(f"Found {len(markets)} tracked markets")
             return markets
         except Exception as e:
             logger.error(f"Error fetching tracked markets: {e}")
             return []
-    
-    def fetch_market_data(self, market_slug: str) -> Optional[Dict[str, Any]]:
-        """Fetch market data for a specific market slug"""
-        try:
-            # Use the direct slug endpoint as shown in the reference code
-            url = f"{GAMMA_API_BASE}/markets/slug/{market_slug}"
-            
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            if data:
-                return data
-            else:
-                logger.warning(f"No data found for market_slug: {market_slug}")
-                return None
-                
-        except requests.RequestException as e:
-            logger.error(f"Error fetching market {market_slug}: {e}")
-            return None
-    
-    def fetch_market_by_condition_id(self, condition_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch market data by searching through paginated results"""
-        try:
-            offset = 0
-            limit = 100
-            max_pages = 10  # Prevent infinite loops
-            
-            for page in range(max_pages):
-                url = f"{GAMMA_API_BASE}/markets"
-                params = {'offset': offset, 'limit': limit}
-                
-                response = self.session.get(url, params=params, timeout=10)
-                response.raise_for_status()
-                
-                markets = response.json()
-                if not markets:
-                    break
-                
-                # Search for our condition_id in the markets
-                for market in markets:
-                    if market.get('conditionId') == condition_id:
-                        logger.info(f"Found market via condition_id: {market.get('slug')}")
-                        return market
-                
-                offset += limit
-                time.sleep(0.1)  # Rate limiting
-            
-            logger.warning(f"Could not find market with condition_id: {condition_id}")
-            return None
-            
-        except requests.RequestException as e:
-            logger.error(f"Error searching for market {condition_id}: {e}")
-            return None
-    
-    def fetch_markets_by_slugs(self, slugs: List[str]) -> List[Dict[str, Any]]:
-        """Fetch multiple markets by their slugs"""
-        markets = []
-        for slug in slugs:
-            try:
-                url = f"{GAMMA_API_BASE}/markets"
-                params = {'slug': slug}
-                
-                response = self.session.get(url, params=params, timeout=10)
-                response.raise_for_status()
-                
-                data = response.json()
-                if data and len(data) > 0:
-                    markets.append(data[0])
-                    
-            except requests.RequestException as e:
-                logger.error(f"Error fetching market {slug}: {e}")
-                
-        return markets
     
     def _parse_json_field(self, field: Any) -> Optional[Any]:
         """Parse JSON field if it's a string"""
@@ -145,7 +219,7 @@ class PolymarketCollector:
         return field
     
     def _to_float(self, value: Any) -> Optional[float]:
-        """Convert value to float, handling None and invalid values"""
+        """Convert value to float"""
         if value is None:
             return None
         try:
@@ -154,7 +228,7 @@ class PolymarketCollector:
             return None
     
     def _to_int(self, value: Any) -> Optional[int]:
-        """Convert value to int, handling None and invalid values"""
+        """Convert value to int"""
         if value is None:
             return None
         try:
@@ -171,64 +245,45 @@ class PolymarketCollector:
         return None
     
     def parse_market_data(self, market: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse market data into database format with all available fields"""
-        
-        # Parse JSON fields
+        """Parse market data into database format"""
         outcome_prices = self._parse_json_field(market.get('outcomePrices'))
         outcomes = self._parse_json_field(market.get('outcomes'))
         clob_token_ids = self._parse_json_field(market.get('clobTokenIds'))
         
         return {
-            # Core identifiers
             'condition_id': market.get('conditionId'),
             'market_slug': market.get('slug'),
             'question': market.get('question'),
             'snapshot_timestamp': datetime.now(timezone.utc).isoformat(),
-            
-            # Market status
             'active': market.get('active'),
             'closed': market.get('closed'),
             'archived': market.get('archived'),
             'restricted': market.get('restricted'),
             'neg_risk': market.get('negRisk', False),
             'accepting_orders': market.get('acceptingOrders'),
-            
-            # Core metrics
             'volume': self._to_float(market.get('volume')),
             'liquidity': self._to_float(market.get('liquidity')),
             'open_interest': self._to_float(market.get('openInterest')),
-            
-            # Volume breakdowns
             'volume_24hr': self._to_float(market.get('volume24hr')),
             'volume_1wk': self._to_float(market.get('volume1wk')),
             'volume_1mo': self._to_float(market.get('volume1mo')),
             'volume_1yr': self._to_float(market.get('volume1yr')),
-            
-            # CLOB-specific volumes
             'volume_clob': self._to_float(market.get('volumeClob')),
             'volume_24hr_clob': self._to_float(market.get('volume24hrClob')),
             'volume_1wk_clob': self._to_float(market.get('volume1wkClob')),
             'volume_1mo_clob': self._to_float(market.get('volume1moClob')),
             'volume_1yr_clob': self._to_float(market.get('volume1yrClob')),
-            
-            # Liquidity metrics
             'liquidity_num': self._to_float(market.get('liquidityNum')),
             'liquidity_clob': self._to_float(market.get('liquidityClob')),
-            
-            # Price data
             'outcome_prices': outcome_prices,
             'last_trade_price': self._to_float(market.get('lastTradePrice')),
             'best_bid': self._to_float(market.get('bestBid')),
             'best_ask': self._to_float(market.get('bestAsk')),
             'spread': self._to_float(market.get('spread')),
-            
-            # Price changes
             'one_hour_price_change': self._to_float(market.get('oneHourPriceChange')),
             'one_day_price_change': self._to_float(market.get('oneDayPriceChange')),
             'one_week_price_change': self._to_float(market.get('oneWeekPriceChange')),
             'one_month_price_change': self._to_float(market.get('oneMonthPriceChange')),
-            
-            # Market metadata
             'outcomes': outcomes,
             'clob_token_ids': clob_token_ids,
             'market_type': market.get('marketType'),
@@ -236,41 +291,29 @@ class PolymarketCollector:
             'description': market.get('description'),
             'image_url': market.get('image'),
             'icon_url': market.get('icon'),
-            
-            # Dates
             'start_date': self._parse_timestamp(market.get('startDate')),
             'end_date': self._parse_timestamp(market.get('endDate')),
             'accepting_orders_timestamp': self._parse_timestamp(market.get('acceptingOrdersTimestamp')),
-            
-            # Trading parameters
             'order_price_min_tick_size': self._to_float(market.get('orderPriceMinTickSize')),
             'order_min_size': self._to_float(market.get('orderMinSize')),
             'rewards_min_size': self._to_float(market.get('rewardsMinSize')),
             'rewards_max_spread': self._to_float(market.get('rewardsMaxSpread')),
-            
-            # Market quality metrics
             'competitive': self._to_float(market.get('competitive')),
             'comment_count': self._to_int(market.get('commentCount')),
-            
-            # UMA resolution
             'uma_bond': self._to_float(market.get('umaBond')),
             'uma_reward': self._to_float(market.get('umaReward')),
-            
-            # Flags
             'enable_order_book': market.get('enableOrderBook'),
             'cyom': market.get('cyom'),
             'featured': market.get('featured'),
             'new': market.get('new'),
             'approved': market.get('approved'),
-            
-            # Timestamps
             'updated_at': self._parse_timestamp(market.get('updatedAt'))
         }
     
     def store_snapshot(self, parsed_data: Dict[str, Any]) -> bool:
         """Store market snapshot in Supabase"""
         try:
-            response = self.supabase.table('polymarket_snapshots').insert(parsed_data).execute()
+            self.supabase.table('polymarket_snapshots').insert(parsed_data).execute()
             logger.info(f"Stored snapshot for market: {parsed_data['market_slug']}")
             return True
         except Exception as e:
@@ -281,12 +324,11 @@ class PolymarketCollector:
         """Main collection function"""
         logger.info("Starting Polymarket data collection")
         
-        # Get tracked markets
         markets = self.get_tracked_markets()
         
         if not markets:
-            logger.warning("No tracked markets found. Add markets to polymarket_tracked_markets table.")
-            return {'success': 0, 'failed': 0, 'skipped': 0}
+            logger.warning("No tracked markets found.")
+            return {'success': 0, 'failed': 0, 'total': 0}
         
         success_count = 0
         failed_count = 0
@@ -294,20 +336,14 @@ class PolymarketCollector:
         for market in markets:
             market_slug = market['slug']
             condition_id = market['condition_id']
-            logger.info(f"Processing market: {market_slug} (condition_id: {condition_id})")
+            logger.info(f"Processing: {market_slug} (condition_id: {condition_id})")
             
-            # Fetch market data - try slug first, fallback to condition_id search
             market_data = self.fetch_market_data(market_slug)
-            
-            if not market_data:
-                logger.info(f"Slug fetch failed, trying condition_id search...")
-                market_data = self.fetch_market_by_condition_id(condition_id)
             
             if not market_data:
                 failed_count += 1
                 continue
             
-            # Parse and store
             parsed_data = self.parse_market_data(market_data)
             
             if self.store_snapshot(parsed_data):

@@ -13,6 +13,8 @@ import logging
 
 # Import the collector
 from collector import PolymarketCollector
+from price_collector import PolymarketPriceCollector
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +61,37 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 
             except Exception as e:
                 logger.error(f"Collection error: {e}", exc_info=True)
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {
+                    'status': 'error',
+                    'error': str(e),
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                self.wfile.write(json.dumps(response).encode())
+            return
+        
+        # Price collection endpoint
+        if parsed_path.path == '/collect-prices':
+            try:
+                logger.info("Price collection triggered via HTTP")
+                collector = PolymarketPriceCollector()
+                stats = collector.collect_all_prices()
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {
+                    'status': 'success',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'stats': stats
+                }
+                self.wfile.write(json.dumps(response).encode())
+                
+            except Exception as e:
+                logger.error(f"Price collection error: {e}", exc_info=True)
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
