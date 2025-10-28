@@ -12,8 +12,9 @@ from urllib.parse import urlparse, parse_qs
 import logging
 
 # Import the collector
-from collector import PolymarketCollector
-from price_collector import PolymarketPriceCollector
+from poly_collector import PolymarketCollector
+from poly_price_collector import PolymarketPriceCollector
+from kalshi_collector import KalshiCollector
 
 
 logging.basicConfig(
@@ -41,10 +42,10 @@ class CollectorHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(response).encode())
             return
         
-        # Collection endpoint
+        # Polymarket collection endpoint
         if parsed_path.path == '/collect':
             try:
-                logger.info("Collection triggered via HTTP")
+                logger.info("Polymarket collection triggered via HTTP")
                 collector = PolymarketCollector()
                 stats = collector.collect_all()
                 
@@ -54,28 +55,30 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 
                 response = {
                     'status': 'success',
+                    'platform': 'polymarket',
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                     'stats': stats
                 }
                 self.wfile.write(json.dumps(response).encode())
                 
             except Exception as e:
-                logger.error(f"Collection error: {e}", exc_info=True)
+                logger.error(f"Polymarket collection error: {e}", exc_info=True)
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 response = {
                     'status': 'error',
+                    'platform': 'polymarket',
                     'error': str(e),
                     'timestamp': datetime.now(timezone.utc).isoformat()
                 }
                 self.wfile.write(json.dumps(response).encode())
             return
         
-        # Price collection endpoint
+        # Polymarket price collection endpoint
         if parsed_path.path == '/collect-prices':
             try:
-                logger.info("Price collection triggered via HTTP")
+                logger.info("Polymarket price collection triggered via HTTP")
                 collector = PolymarketPriceCollector()
                 stats = collector.collect_all_prices()
                 
@@ -85,13 +88,94 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 
                 response = {
                     'status': 'success',
+                    'platform': 'polymarket',
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                     'stats': stats
                 }
                 self.wfile.write(json.dumps(response).encode())
                 
             except Exception as e:
-                logger.error(f"Price collection error: {e}", exc_info=True)
+                logger.error(f"Polymarket price collection error: {e}", exc_info=True)
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {
+                    'status': 'error',
+                    'platform': 'polymarket',
+                    'error': str(e),
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                self.wfile.write(json.dumps(response).encode())
+            return
+        
+        # Kalshi price collection endpoint
+        if parsed_path.path == '/collect-kalshi':
+            try:
+                logger.info("Kalshi price collection triggered via HTTP")
+                collector = KalshiCollector()
+                stats = collector.collect_all_prices()
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {
+                    'status': 'success',
+                    'platform': 'kalshi',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'stats': stats
+                }
+                self.wfile.write(json.dumps(response).encode())
+                
+            except Exception as e:
+                logger.error(f"Kalshi price collection error: {e}", exc_info=True)
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {
+                    'status': 'error',
+                    'platform': 'kalshi',
+                    'error': str(e),
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                self.wfile.write(json.dumps(response).encode())
+            return
+        
+        # Combined collection endpoint (both platforms)
+        if parsed_path.path == '/collect-all':
+            try:
+                logger.info("Combined collection triggered via HTTP")
+                results = {}
+                
+                # Collect Polymarket prices
+                try:
+                    poly_collector = PolymarketPriceCollector()
+                    results['polymarket'] = poly_collector.collect_all_prices()
+                except Exception as e:
+                    logger.error(f"Polymarket collection failed: {e}")
+                    results['polymarket'] = {'error': str(e)}
+                
+                # Collect Kalshi prices
+                try:
+                    kalshi_collector = KalshiCollector()
+                    results['kalshi'] = kalshi_collector.collect_all_prices()
+                except Exception as e:
+                    logger.error(f"Kalshi collection failed: {e}")
+                    results['kalshi'] = {'error': str(e)}
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {
+                    'status': 'success',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'results': results
+                }
+                self.wfile.write(json.dumps(response).encode())
+                
+            except Exception as e:
+                logger.error(f"Combined collection error: {e}", exc_info=True)
                 self.send_response(500)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
@@ -109,10 +193,15 @@ class CollectorHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             response = {
-                'service': 'Polymarket Data Collector',
+                'service': 'Prediction Markets Data Collector',
+                'platforms': ['Polymarket', 'Kalshi'],
                 'endpoints': {
                     '/health': 'Health check',
-                    '/collect': 'Trigger data collection'
+                    '/collect': 'Trigger Polymarket data collection',
+                    '/collect-prices': 'Trigger Polymarket price collection',
+                    '/collect-kalshi': 'Trigger Kalshi price collection',
+                    '/collect-all': 'Trigger collection for all platforms',
+                    '/kalshi/add-market': 'POST: Add a Kalshi market to tracking'
                 },
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }

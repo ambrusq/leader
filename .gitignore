@@ -5,6 +5,7 @@
 /collector/markets.sql
 /collector/Usage.rtf
 /collector/market_data
+/collector/Kalshi_market_data
 /collector/polymarket_tokens.csv
 
 /collector/__pycache__
