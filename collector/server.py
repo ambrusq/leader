@@ -11,10 +11,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import logging
 
-# Import the collector
+# Import the collectors
 from poly_collector import PolymarketCollector
 from poly_price_collector import PolymarketPriceCollector
 from kalshi_collector import KalshiCollector
+from signal_detector import SignalDetector, SignalConfig
 
 
 logging.basicConfig(
@@ -187,6 +188,55 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(response).encode())
             return
         
+        # Signal detection endpoint
+        if parsed_path.path == '/detect-signals':
+            try:
+                # Parse query parameters
+                query_params = parse_qs(parsed_path.query)
+                
+                # Get optional parameters
+                lookback_hours = int(query_params.get('lookback_hours', [24])[0])
+                min_absolute = float(query_params.get('min_absolute', [0.10])[0])
+                min_relative = float(query_params.get('min_relative', [0.25])[0])
+                use_all_available = query_params.get('use_all_available', ['false'])[0].lower() == 'true'
+                
+                logger.info(f"Signal detection triggered via HTTP (lookback: {lookback_hours}h, use_all: {use_all_available})")
+                
+                # Create config
+                config = SignalConfig(
+                    min_absolute_change=min_absolute,
+                    min_relative_change=min_relative,
+                    historical_lookback=lookback_hours
+                )
+                
+                # Run detection
+                detector = SignalDetector(config)
+                stats = detector.run_detection_all_markets(lookback_hours, use_all_available)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                
+                response = {
+                    'status': 'success',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'stats': stats
+                }
+                self.wfile.write(json.dumps(response).encode())
+                
+            except Exception as e:
+                logger.error(f"Signal detection error: {e}", exc_info=True)
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                response = {
+                    'status': 'error',
+                    'error': str(e),
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                self.wfile.write(json.dumps(response).encode())
+            return
+        
         # Root endpoint
         if parsed_path.path == '/':
             self.send_response(200)
@@ -201,6 +251,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                     '/collect-prices': 'Trigger Polymarket price collection',
                     '/collect-kalshi': 'Trigger Kalshi price collection',
                     '/collect-all': 'Trigger collection for all platforms',
+                    '/detect-signals': 'Detect market signals (params: lookback_hours, min_absolute, min_relative, use_all_available=true)',
                     '/kalshi/add-market': 'POST: Add a Kalshi market to tracking'
                 },
                 'timestamp': datetime.now(timezone.utc).isoformat()

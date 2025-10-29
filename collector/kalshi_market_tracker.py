@@ -25,8 +25,15 @@ BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 # Market URLs to track - ADD YOUR URLS HERE
 MARKET_URLS = [
-    "https://kalshi.com/markets/kxnysecircuit/nyse-circuit-breaker-day/kxnysecircuit-26",
-    "https://kalshi.com/markets/kxaaagasm/us-gas-price/kxaaagasm-25oct31",
+    "https://kalshi.com/markets/kxchinausgdp/china-overtakes-us-gdp/chinausgdp",
+    "https://kalshi.com/markets/kxgdpyear/annual-gdp/kxgdpyear-25",
+    "https://kalshi.com/markets/kxgdp/us-gdp-growth/kxgdp-25oct30",
+    "https://kalshi.com/markets/kxtrumpputin2/trump-putin-meet-again-this-year/kxtrumpputin2-26jan01",
+    "https://kalshi.com/markets/kxdjtvostariffs/tariffs-case/kxdjtvostariffs",
+    "https://kalshi.com/markets/kxbtcvsgold/btc-vs-gold/kxbtcvsgold-25",
+    "https://kalshi.com/markets/kxtariffrateprc/tariff-rate-china/kxtariffrateprc-26jan01",
+    "https://kalshi.com/markets/kxwrecss/world-recessions/wrecss-26",
+    "https://kalshi.com/markets/kxratecutcount/number-of-rate-cuts/kxratecutcount-25dec31",
 ]
 
 

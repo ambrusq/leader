@@ -12,7 +12,15 @@ CANDLESTICK_LIMIT = 4900  # Stay under 5000 limit with buffer
 
 # Market URLs to fetch - ADD YOUR URLS HERE
 MARKET_URLS = [
+    "https://kalshi.com/markets/kxchinausgdp/china-overtakes-us-gdp/chinausgdp",
+    "https://kalshi.com/markets/kxgdpyear/annual-gdp/kxgdpyear-25",
+    "https://kalshi.com/markets/kxgdp/us-gdp-growth/kxgdp-25oct30",
+    "https://kalshi.com/markets/kxtrumpputin2/trump-putin-meet-again-this-year/kxtrumpputin2-26jan01",
+    "https://kalshi.com/markets/kxdjtvostariffs/tariffs-case/kxdjtvostariffs",
     "https://kalshi.com/markets/kxbtcvsgold/btc-vs-gold/kxbtcvsgold-25",
+    "https://kalshi.com/markets/kxtariffrateprc/tariff-rate-china/kxtariffrateprc-26jan01",
+    "https://kalshi.com/markets/kxwrecss/world-recessions/wrecss-26",
+    "https://kalshi.com/markets/kxratecutcount/number-of-rate-cuts/kxratecutcount-25dec31",
 ]
 
 
@@ -145,19 +153,21 @@ def process_candlesticks_to_dataframe(candlesticks):
     return pd.DataFrame(rows)
 
 
-def save_to_csv(df, ticker, output_folder):
+def save_to_csv(df, ticker, event_ticker, output_folder):
     """Save DataFrame to CSV file."""
-    Path(output_folder).mkdir(exist_ok=True)
+    # Create event-specific subfolder
+    event_folder = Path(output_folder) / event_ticker
+    event_folder.mkdir(parents=True, exist_ok=True)
     
     # Save full dataset
-    full_filename = f"{output_folder}/{ticker}_full.csv"
+    full_filename = event_folder / f"{ticker}_full.csv"
     df.to_csv(full_filename, index=False)
     print(f"✓ Saved {len(df)} rows (full data) to {full_filename}")
     
     # Save filtered dataset with only rows that have price data (trades occurred)
     df_trades = df[df['price_close'].notna()].copy()
     if len(df_trades) > 0:
-        trades_filename = f"{output_folder}/{ticker}_trades.csv"
+        trades_filename = event_folder / f"{ticker}_trades.csv"
         df_trades.to_csv(trades_filename, index=False)
         print(f"✓ Saved {len(df_trades)} rows (trades only) to {trades_filename}")
     else:
@@ -196,7 +206,7 @@ def process_market(market_data):
     
     # Convert to DataFrame and save
     df = process_candlesticks_to_dataframe(candlesticks)
-    save_to_csv(df, ticker, OUTPUT_FOLDER)
+    save_to_csv(df, ticker, event_ticker, OUTPUT_FOLDER)
 
 
 def main():

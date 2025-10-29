@@ -3,11 +3,12 @@
 Event Management Utility
 Helps manage events and their markets
 """
+
 from dotenv import load_dotenv
 load_dotenv()
 
 import sys
-from collector import PolymarketCollector
+from poly_collector import PolymarketCollector
 import json
 
 def list_events(collector):
