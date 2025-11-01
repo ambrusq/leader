@@ -1,0 +1,4 @@
+market_id,source,signal_type,timestamp,direction,prior_price,new_price,price_change,percent_change,time_window_minutes,explanation,prior_timestamp,ticker,condition_id
+null,kalshi,relative_change,2025-10-28T17:27:00+00:00,down,0.080000,0.060000,-0.020000,-0.2500,454,Down 25.0% change,2025-10-28T09:53:00+00:00,null,
+null,kalshi,relative_change,2025-10-29T14:35:00+00:00,down,0.080000,0.060000,-0.020000,-0.2500,773,Down 25.0% change,2025-10-29T01:42:00+00:00,null,
+null,kalshi,relative_change,2025-10-29T17:41:00+00:00,up,0.050000,0.070000,0.020000,0.4000,120,Up 40.0% change,2025-10-29T15:41:00+00:00,null,

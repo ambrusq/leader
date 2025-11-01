@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple web server for Render deployment
+Web server for Render deployment
 Provides an HTTP endpoint that triggers data collection
 """
 
@@ -15,7 +15,7 @@ import logging
 from poly_collector import PolymarketCollector
 from poly_price_collector import PolymarketPriceCollector
 from kalshi_collector import KalshiCollector
-from signal_detector import SignalDetector, SignalConfig
+from signal_detector import SignalDetector
 
 
 logging.basicConfig(
@@ -194,24 +194,14 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 # Parse query parameters
                 query_params = parse_qs(parsed_path.query)
                 
-                # Get optional parameters
-                lookback_hours = int(query_params.get('lookback_hours', [24])[0])
-                min_absolute = float(query_params.get('min_absolute', [0.10])[0])
-                min_relative = float(query_params.get('min_relative', [0.25])[0])
-                use_all_available = query_params.get('use_all_available', ['false'])[0].lower() == 'true'
+                # Get threshold parameter (default 5%)
+                threshold = float(query_params.get('threshold', [0.05])[0])
                 
-                logger.info(f"Signal detection triggered via HTTP (lookback: {lookback_hours}h, use_all: {use_all_available})")
-                
-                # Create config
-                config = SignalConfig(
-                    min_absolute_change=min_absolute,
-                    min_relative_change=min_relative,
-                    historical_lookback=lookback_hours
-                )
+                logger.info(f"Signal detection triggered via HTTP (threshold: {threshold:.1%})")
                 
                 # Run detection
-                detector = SignalDetector(config)
-                stats = detector.run_detection_all_markets(lookback_hours, use_all_available)
+                detector = SignalDetector(threshold_percent=threshold)
+                results = detector.process_all_markets()
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
@@ -220,7 +210,8 @@ class CollectorHandler(BaseHTTPRequestHandler):
                 response = {
                     'status': 'success',
                     'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'stats': stats
+                    'threshold': threshold,
+                    'results': results
                 }
                 self.wfile.write(json.dumps(response).encode())
                 
@@ -251,7 +242,7 @@ class CollectorHandler(BaseHTTPRequestHandler):
                     '/collect-prices': 'Trigger Polymarket price collection',
                     '/collect-kalshi': 'Trigger Kalshi price collection',
                     '/collect-all': 'Trigger collection for all platforms',
-                    '/detect-signals': 'Detect market signals (params: lookback_hours, min_absolute, min_relative, use_all_available=true)',
+                    '/detect-signals': 'Detect market signals (params: threshold=0.05)',
                     '/kalshi/add-market': 'POST: Add a Kalshi market to tracking'
                 },
                 'timestamp': datetime.now(timezone.utc).isoformat()

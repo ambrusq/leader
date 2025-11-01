@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-Market Signal Detector
-Detects significant price movements in prediction markets and stores them as signal events
+Market Signal Detector with Trend Detection
+Detects both short-term alerts (relative changes) and sustained trends
 """
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import logging
-from datetime import datetime, timezone, timedelta
+import csv
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
-from enum import Enum
-import json
-import csv
-from dateutil import parser as date_parser
 
 from supabase import create_client, Client
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -27,480 +25,366 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
 
 
-class SignalType(Enum):
-    """Types of signals that can be detected"""
-    ABSOLUTE_CHANGE = "absolute_change"  # Large absolute price change
-    RELATIVE_CHANGE = "relative_change"  # Large percentage change
-    RAPID_MOVEMENT = "rapid_movement"    # Fast change in short time
-    VOLATILITY_SPIKE = "volatility_spike"  # Sudden increase in volatility
-
-
-class Direction(Enum):
-    """Direction of price movement"""
-    UP = "up"
-    DOWN = "down"
-
-
 @dataclass
-class SignalConfig:
-    """Configuration for signal detection thresholds"""
-    # Absolute change thresholds (in price points, 0-1 scale)
-    min_absolute_change: float = 0.10  # 10 percentage points
-    large_absolute_change: float = 0.20  # 20 percentage points
-    
-    # Relative change thresholds (percentage of current price)
-    min_relative_change: float = 0.25  # 25% change
-    large_relative_change: float = 0.50  # 50% change
-    
-    # Time windows for analysis (in minutes)
-    short_window: int = 15    # 15 minutes
-    medium_window: int = 60   # 1 hour
-    long_window: int = 240    # 4 hours
-    day_window: int = 1440
-    
-    # Minimum price to consider (avoid noise from very low probability events)
-    min_price_threshold: float = 0.05  # 5%
-    
-    # Lookback period for historical analysis (in hours)
-    historical_lookback: int = 24
-
-
-def get_supabase_client() -> Client:
-    """Initialize and return Supabase client"""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+class Signal:
+    """Signal data structure for both alerts and trends"""
+    market_id: str
+    source: str
+    timestamp: datetime
+    prior_timestamp: datetime
+    prior_price: float
+    new_price: float
+    percent_change: float
+    direction: str
+    signal_type: str = 'relative_change'  # 'relative_change' or 'trend'
+    ticker: Optional[str] = None
+    condition_id: Optional[str] = None
+    window_size: Optional[int] = None  # For trends
 
 
 class SignalDetector:
-    """Detects significant market signals from price data"""
+    """Detects signals by comparing neighboring price datapoints and trends"""
     
-    def __init__(self, config: Optional[SignalConfig] = None):
-        self.supabase = get_supabase_client()
-        self.config = config or SignalConfig()
-    
-    def ensure_signals_table(self):
-        """Ensure the market_signals table exists"""
-        # Note: This should ideally be done via migration, but including SQL for reference
-        create_table_sql = """
-        CREATE TABLE IF NOT EXISTS public.market_signals (
-            id BIGSERIAL PRIMARY KEY,
-            market_id TEXT NOT NULL,
-            ticker TEXT,  -- For Kalshi
-            condition_id TEXT,  -- For Polymarket
-            source TEXT NOT NULL CHECK (source IN ('polymarket', 'kalshi')),
-            signal_type TEXT NOT NULL,
-            timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-            direction TEXT NOT NULL CHECK (direction IN ('up', 'down')),
-            prior_price NUMERIC(10, 6) NOT NULL,
-            new_price NUMERIC(10, 6) NOT NULL,
-            price_change NUMERIC(10, 6) NOT NULL,
-            percent_change NUMERIC(10, 4),
-            time_window_minutes INTEGER,
-            explanation TEXT,
-            metadata JSONB,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            CONSTRAINT unique_signal UNIQUE (market_id, timestamp, signal_type)
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_signals_market_id ON public.market_signals(market_id);
-        CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON public.market_signals(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_signals_source ON public.market_signals(source);
-        CREATE INDEX IF NOT EXISTS idx_signals_type ON public.market_signals(signal_type);
-        """
-        logger.info("Signals table should be created via migration")
-        # The actual table creation should be done via Supabase dashboard or migration
-    
-    def get_polymarket_price_data(
-        self, 
-        condition_id: str, 
-        lookback_hours: int
-    ) -> List[Dict[str, Any]]:
-        """Get Polymarket price history for a condition"""
-        try:
-            start_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-            
-            response = self.supabase.table('polymarket_price_history')\
-                .select('*')\
-                .eq('condition_id', condition_id)\
-                .gte('timestamp', start_time.isoformat())\
-                .order('timestamp', desc=False)\
-                .execute()
-            
-            return response.data if response.data else []
-        except Exception as e:
-            logger.error(f"Error fetching Polymarket data for {condition_id}: {e}")
-            return []
-    
-    def get_all_polymarket_price_data(self, condition_id: str) -> List[Dict[str, Any]]:
-        """Get all available Polymarket price history for a condition"""
-        try:
-            response = self.supabase.table('polymarket_price_history')\
-                .select('*')\
-                .eq('condition_id', condition_id)\
-                .order('timestamp', desc=False)\
-                .limit(10000)\
-                .execute()
-            
-            return response.data if response.data else []
-        except Exception as e:
-            logger.error(f"Error fetching all Polymarket data for {condition_id}: {e}")
-            return []
-    
-    def get_kalshi_price_data(
-        self, 
-        ticker: str, 
-        lookback_hours: int
-    ) -> List[Dict[str, Any]]:
-        """Get Kalshi price history for a ticker"""
-        try:
-            start_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-            
-            response = self.supabase.table('kalshi_price_history')\
-                .select('*')\
-                .eq('ticker', ticker)\
-                .gte('timestamp', start_time.isoformat())\
-                .order('timestamp', desc=False)\
-                .execute()
-            
-            return response.data if response.data else []
-        except Exception as e:
-            logger.error(f"Error fetching Kalshi data for {ticker}: {e}")
-            return []
-    
-    def get_all_kalshi_price_data(self, ticker: str) -> List[Dict[str, Any]]:
-        """Get all available Kalshi price history for a ticker"""
-        try:
-            response = self.supabase.table('kalshi_price_history')\
-                .select('*')\
-                .eq('ticker', ticker)\
-                .order('timestamp', desc=False)\
-                .limit(10000)\
-                .execute()
-            
-            return response.data if response.data else []
-        except Exception as e:
-            logger.error(f"Error fetching all Kalshi data for {ticker}: {e}")
-            return []
-    
-    def normalize_kalshi_price(self, row: Dict[str, Any]) -> Optional[float]:
-        """Extract a single price from Kalshi data (prefer close, fallback to mean)"""
-        if row.get('price_close') is not None:
-            return float(row['price_close'])
-        elif row.get('price_mean') is not None:
-            return float(row['price_mean'])
-        return None
-    
-    def detect_signals_in_window(
+    def __init__(
         self,
-        prices: List[Tuple[datetime, float]],
-        window_minutes: int,
-        market_id: str,
-        source: str
-    ) -> List[Dict[str, Any]]:
-        """Detect signals within a specific time window"""
+        threshold_percent: float = 0.5,
+        trend_threshold_percent: float = 0.15,
+        trend_window_size: int = 10,
+        trend_stability_points: int = 3
+    ):
+        """
+        Initialize detector
+        
+        Args:
+            threshold_percent: Minimum relative change for alerts (default 5%)
+            trend_threshold_percent: Minimum change for trends (default 15%)
+            trend_window_size: Number of points for rolling window baseline (default 10)
+            trend_stability_points: Points to confirm trend isn't reversed (default 3)
+        """
+        self.threshold = threshold_percent
+        self.trend_threshold = trend_threshold_percent
+        self.trend_window_size = trend_window_size
+        self.trend_stability_points = trend_stability_points
+        self.supabase = self._get_supabase_client()
+    
+    def _get_supabase_client(self) -> Client:
+        """Initialize Supabase client"""
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+    def detect_signals(self, prices: List[Tuple[datetime, float]]) -> List[Signal]:
+        """
+        Detect alert signals from a list of (timestamp, price) tuples
+        
+        Args:
+            prices: List of (timestamp, price) sorted by timestamp
+            
+        Returns:
+            List of detected signals
+        """
         signals = []
         
         if len(prices) < 2:
             return signals
         
-        # Track when we last detected a signal to avoid duplicates
-        last_signal_time = None
-        cooldown_minutes = window_minutes  # Don't detect another signal within the same window
-        
-        # Analyze price changes over the window
         for i in range(1, len(prices)):
+            prior_time, prior_price = prices[i-1]
             current_time, current_price = prices[i]
             
-            # Skip if we're in cooldown period from last signal
-            if last_signal_time and (current_time - last_signal_time).total_seconds() < cooldown_minutes * 60:
+            # Skip if prior price is zero (avoid division by zero)
+            if prior_price == 0:
                 continue
             
-            # Find price at window_minutes ago
-            window_start = current_time - timedelta(minutes=window_minutes)
+            # Calculate relative change
+            price_change = current_price - prior_price
+            percent_change = price_change / prior_price
             
-            # Find the closest price to window_start
-            prior_price = None
-            prior_time = None
-            
-            for j in range(i - 1, -1, -1):
-                check_time, check_price = prices[j]
-                if check_time <= window_start:
-                    prior_price = check_price
-                    prior_time = check_time
-                    break
-            
-            if prior_price is None or prior_price < self.config.min_price_threshold:
-                continue
-            
-            # Calculate changes
-            absolute_change = abs(current_price - prior_price)
-            relative_change = absolute_change / prior_price if prior_price > 0 else 0
-            direction = Direction.UP if current_price > prior_price else Direction.DOWN
-            
-            # Check thresholds
-            detected = False
-            signal_type = None
-            explanation = None
-            
-            # Absolute change detection
-            if absolute_change >= self.config.large_absolute_change:
-                detected = True
-                signal_type = SignalType.ABSOLUTE_CHANGE.value
-                explanation = f"Large absolute change of {absolute_change:.1%} ({direction.value}) in {window_minutes} minutes"
-            elif absolute_change >= self.config.min_absolute_change and window_minutes <= self.config.short_window:
-                detected = True
-                signal_type = SignalType.RAPID_MOVEMENT.value
-                explanation = f"Rapid {direction.value} movement of {absolute_change:.1%} in {window_minutes} minutes"
-            
-            # Relative change detection
-            if relative_change >= self.config.large_relative_change:
-                detected = True
-                signal_type = SignalType.RELATIVE_CHANGE.value
-                explanation = f"Large relative change of {relative_change:.1%} ({direction.value}) in {window_minutes} minutes"
-            elif relative_change >= self.config.min_relative_change and window_minutes <= self.config.medium_window:
-                if not detected:  # Don't override absolute change signals
-                    detected = True
-                    signal_type = SignalType.RELATIVE_CHANGE.value
-                    explanation = f"Significant relative change of {relative_change:.1%} ({direction.value}) in {window_minutes} minutes"
-            
-            if detected:
-                signals.append({
-                    'market_id': market_id,
-                    'source': source,
-                    'signal_type': signal_type,
-                    'timestamp': current_time.isoformat(),
-                    'direction': direction.value,
-                    'prior_price': float(prior_price),
-                    'new_price': float(current_price),
-                    'price_change': float(current_price - prior_price),
-                    'percent_change': float(relative_change),
-                    'time_window_minutes': window_minutes,
-                    'explanation': explanation,
-                    'metadata': {
-                        'prior_timestamp': prior_time.isoformat() if prior_time else None,
-                        'absolute_change': float(absolute_change),
-                        'config_used': {
-                            'min_absolute': self.config.min_absolute_change,
-                            'min_relative': self.config.min_relative_change
-                        }
-                    },
-                    # Store condition_id for Polymarket, will be set properly in store_signals
-                    'condition_id': market_id if source == 'polymarket' else None,
-                    'ticker': market_id if source == 'kalshi' else None
-                })
+            # Check if change exceeds threshold
+            if abs(percent_change) >= self.threshold:
+                direction = 'up' if price_change > 0 else 'down'
                 
-                # Set cooldown to avoid detecting the same movement multiple times
-                last_signal_time = current_time
+                signal = Signal(
+                    market_id='',  # Will be set by caller
+                    source='',     # Will be set by caller
+                    timestamp=current_time,
+                    prior_timestamp=prior_time,
+                    prior_price=prior_price,
+                    new_price=current_price,
+                    percent_change=percent_change,
+                    direction=direction,
+                    signal_type='relative_change'
+                )
+                signals.append(signal)
         
         return signals
     
-    def detect_polymarket_signals(
-        self,
-        condition_id: str,
-        lookback_hours: Optional[int] = None,
-        use_all_available: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Detect signals for a Polymarket market"""
-        lookback = lookback_hours or self.config.historical_lookback
-        
-        logger.info(f"Analyzing Polymarket condition: {condition_id}")
-        
-        # Get price data
-        price_data = self.get_polymarket_price_data(condition_id, lookback)
-        
-        # If no recent data and use_all_available is True, try to get any data
-        if not price_data and use_all_available:
-            logger.info(f"No recent data, fetching all available data for {condition_id}")
-            price_data = self.get_all_polymarket_price_data(condition_id)
-        
-        if not price_data:
-            logger.warning(f"No price data for {condition_id}")
-            return []
-        
-        # Normalize to (timestamp, price) tuples
-        prices = []
-        for row in price_data:
-            if row.get('price') is not None:
-                timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
-                prices.append((timestamp, float(row['price'])))
-        
-        if len(prices) < 2:
-            logger.warning(f"Insufficient price data for {condition_id}")
-            return []
-        
-        logger.info(f"Analyzing {len(prices)} price points for {condition_id}")
-        
-        # Detect signals across different time windows
-        all_signals = []
-        
-        for window in [self.config.short_window, self.config.medium_window, self.config.long_window, self.config.day_window]:
-            signals = self.detect_signals_in_window(
-                prices, window, condition_id, 'polymarket'
-            )
-            all_signals.extend(signals)
-        
-        # Deduplicate signals (keep most significant per timestamp)
-        unique_signals = self.deduplicate_signals(all_signals)
-        
-        logger.info(f"Detected {len(unique_signals)} signals for {condition_id}")
-        return unique_signals
-    
-    def detect_kalshi_signals(
-        self,
-        ticker: str,
-        lookback_hours: Optional[int] = None,
-        use_all_available: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Detect signals for a Kalshi market"""
-        lookback = lookback_hours or self.config.historical_lookback
-        
-        logger.info(f"Analyzing Kalshi ticker: {ticker}")
-        
-        # Get price data
-        price_data = self.get_kalshi_price_data(ticker, lookback)
-        
-        # If no recent data and use_all_available is True, try to get any data
-        if not price_data and use_all_available:
-            logger.info(f"No recent data, fetching all available data for {ticker}")
-            price_data = self.get_all_kalshi_price_data(ticker)
-        
-        if not price_data:
-            logger.warning(f"No price data for {ticker}")
-            return []
-        
-        # Normalize to (timestamp, price) tuples
-        prices = []
-        for row in price_data:
-            price = self.normalize_kalshi_price(row)
-            if price is not None:
-                timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
-                prices.append((timestamp, price))
-        
-        if len(prices) < 2:
-            logger.warning(f"Insufficient price data for {ticker}")
-            return []
-        
-        logger.info(f"Analyzing {len(prices)} price points for {ticker}")
-        
-        # Detect signals across different time windows
-        all_signals = []
-        
-        for window in [self.config.short_window, self.config.medium_window, self.config.long_window, self.config.day_window]:
-            signals = self.detect_signals_in_window(
-                prices, window, ticker, 'kalshi'
-            )
-            all_signals.extend(signals)
-        
-        # Add ticker to metadata
-        for signal in all_signals:
-            signal['ticker'] = ticker
-        
-        # Deduplicate signals
-        unique_signals = self.deduplicate_signals(all_signals)
-        
-        logger.info(f"Detected {len(unique_signals)} signals for {ticker}")
-        return unique_signals
-    
-    def deduplicate_signals(self, signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicate signals, keeping only the first detection of each price movement
-        
-        Strategy:
-        1. Group signals by time proximity (within 5 minutes = same event)
-        2. Within each group, keep only the earliest detection
-        3. If multiple time windows detected the same event, prefer shorter windows (more immediate)
+    def detect_trends(self, prices: List[Tuple[datetime, float]]) -> List[Signal]:
         """
-        if not signals:
-            return []
+        Detect sustained trend signals using rolling window
         
-        # Sort by timestamp
-        sorted_signals = sorted(signals, key=lambda x: x['timestamp'])
-        
-        unique = []
-        last_kept_signal = None
-        
-        for signal in sorted_signals:
-            current_time = datetime.fromisoformat(signal['timestamp'])
+        Args:
+            prices: List of (timestamp, price) sorted by timestamp
             
-            # If this is the first signal, keep it
-            if last_kept_signal is None:
-                unique.append(signal)
-                last_kept_signal = signal
+        Returns:
+            List of detected trend signals
+        """
+        trends = []
+        
+        # Need enough points for window + stability check
+        min_points = self.trend_window_size + self.trend_stability_points
+        if len(prices) < min_points:
+            return trends
+        
+        # Track last detected trend to avoid duplicates for same trend
+        last_trend_idx = -1
+        
+        for i in range(self.trend_window_size, len(prices) - self.trend_stability_points + 1):
+            # Get window of previous prices
+            window_start = i - self.trend_window_size
+            window = prices[window_start:i]
+            window_prices = [p for _, p in window]
+            
+            # Calculate window baseline (mean)
+            window_mean = sum(window_prices) / len(window_prices)
+            
+            if window_mean == 0:
                 continue
             
-            last_time = datetime.fromisoformat(last_kept_signal['timestamp'])
-            time_diff_minutes = (current_time - last_time).total_seconds() / 60
+            # Current price and timestamp
+            current_time, current_price = prices[i]
+            window_start_time, window_start_price = window[0]
             
-            # Check if this is the same event (within 5 minutes and same direction)
-            if (time_diff_minutes <= 5 and 
-                signal['direction'] == last_kept_signal['direction']):
+            # Calculate change from window mean
+            price_change = current_price - window_mean
+            percent_change = price_change / window_mean
+            
+            # Check if exceeds trend threshold
+            if abs(percent_change) < self.trend_threshold:
+                continue
+            
+            direction = 'up' if price_change > 0 else 'down'
+            
+            # Check stability: verify trend holds for next few points
+            is_stable = True
+            for j in range(1, min(self.trend_stability_points + 1, len(prices) - i)):
+                future_time, future_price = prices[i + j]
+                future_change = (future_price - window_mean) / window_mean
                 
-                # Same event detected multiple times - only keep if:
-                # 1. It's a different, more significant type of signal
-                # 2. The price change is substantially larger (>20% more)
-                
-                price_change_diff = abs(signal['price_change']) - abs(last_kept_signal['price_change'])
-                relative_increase = price_change_diff / abs(last_kept_signal['price_change']) if last_kept_signal['price_change'] != 0 else 0
-                
-                if relative_increase > 0.2:  # 20% larger movement
-                    # Replace the last signal with this larger one
-                    unique[-1] = signal
-                    last_kept_signal = signal
-                # Otherwise skip this signal (it's a duplicate)
-            else:
-                # Different event - keep it
-                unique.append(signal)
-                last_kept_signal = signal
+                # If direction reverses significantly, trend is not stable
+                if direction == 'up' and future_change < percent_change * 0.5:
+                    is_stable = False
+                    break
+                elif direction == 'down' and future_change > percent_change * 0.5:
+                    is_stable = False
+                    break
+            
+            if not is_stable:
+                continue
+            
+            # Avoid detecting same trend multiple times (skip nearby indices)
+            if i - last_trend_idx < self.trend_window_size // 2:
+                continue
+            
+            last_trend_idx = i
+            
+            trend = Signal(
+                market_id='',  # Will be set by caller
+                source='',     # Will be set by caller
+                timestamp=current_time,
+                prior_timestamp=window_start_time,
+                prior_price=window_mean,  # Use window mean as baseline
+                new_price=current_price,
+                percent_change=percent_change,
+                direction=direction,
+                signal_type='trend',
+                window_size=self.trend_window_size
+            )
+            trends.append(trend)
         
-        return unique
+        return trends
     
-    def store_signals(self, signals: List[Dict[str, Any]]) -> int:
-        """Store detected signals in the database
-        
-        Uses upsert to avoid duplicates - signals with same market_id, timestamp, 
-        and signal_type will be updated rather than duplicated
-        """
-        if not signals:
-            return 0
-        
+    def get_polymarket_prices(self, condition_id: str) -> List[Tuple[datetime, float]]:
+        """Get all price data for a Polymarket condition"""
         try:
-            # Prepare records with consistent fields
-            prepared_signals = []
-            for signal in signals:
-                # Create a clean record with all required fields
-                record = {
-                    'market_id': signal['market_id'],
-                    'source': signal['source'],
-                    'signal_type': signal['signal_type'],
-                    'timestamp': signal['timestamp'],
-                    'direction': signal['direction'],
-                    'prior_price': signal['prior_price'],
-                    'new_price': signal['new_price'],
-                    'price_change': signal['price_change'],
-                    'percent_change': signal.get('percent_change'),
-                    'time_window_minutes': signal.get('time_window_minutes'),
-                    'explanation': signal.get('explanation'),
-                    'metadata': signal.get('metadata', {}),  # Keep as dict, Supabase will handle JSONB
-                    'ticker': signal.get('ticker'),  # For Kalshi
-                    'condition_id': signal.get('condition_id')  # For Polymarket
-                }
-                prepared_signals.append(record)
+            # Fetch all data using pagination
+            all_data = []
+            offset = 0
+            limit = 1000
             
-            # Use upsert with onConflict to handle duplicates
-            # The unique constraint is on (market_id, timestamp, signal_type)
-            response = self.supabase.table('market_signals')\
-                .upsert(prepared_signals, on_conflict='market_id,timestamp,signal_type')\
-                .execute()
+            while True:
+                response = self.supabase.table('polymarket_price_history')\
+                    .select('timestamp, price')\
+                    .eq('condition_id', condition_id)\
+                    .not_.is_('price', 'null')\
+                    .order('timestamp', desc=False)\
+                    .limit(limit)\
+                    .offset(offset)\
+                    .execute()
+                
+                if not response.data:
+                    break
+                
+                all_data.extend(response.data)
+                
+                # If we got fewer rows than limit, we've reached the end
+                if len(response.data) < limit:
+                    break
+                
+                offset += limit
             
-            count = len(response.data) if response.data else 0
-            logger.info(f"Stored/updated {count} signals")
-            return count
+            prices = []
+            for row in all_data:
+                timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                price = float(row['price'])
+                prices.append((timestamp, price))
+            
+            logger.info(f"Fetched {len(prices)} total price points for {condition_id}")
+            return prices
             
         except Exception as e:
-            logger.error(f"Error storing signals: {e}")
-            return 0
+            logger.error(f"Error fetching Polymarket prices for {condition_id}: {e}")
+            return []
     
-    def get_active_polymarket_markets(self) -> List[str]:
+    def get_kalshi_prices(self, ticker: str) -> List[Tuple[datetime, float]]:
+        """Get all price data for a Kalshi ticker"""
+        try:
+            # Fetch all data using pagination
+            all_data = []
+            offset = 0
+            limit = 1000
+            
+            while True:
+                response = self.supabase.table('kalshi_price_history')\
+                    .select('timestamp, price_close, price_mean')\
+                    .eq('ticker', ticker)\
+                    .order('timestamp', desc=False)\
+                    .limit(limit)\
+                    .offset(offset)\
+                    .execute()
+                
+                if not response.data:
+                    break
+                
+                all_data.extend(response.data)
+                
+                # If we got fewer rows than limit, we've reached the end
+                if len(response.data) < limit:
+                    break
+                
+                offset += limit
+            
+            prices = []
+            for row in all_data:
+                timestamp = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+                
+                # Use price_close, fall back to price_mean
+                price = row.get('price_close') or row.get('price_mean')
+                if price is None:
+                    continue
+                
+                price = float(price)
+                
+                # Convert from cents to 0-1 scale if needed
+                if price > 1:
+                    price = price / 100.0
+                
+                prices.append((timestamp, price))
+            
+            logger.info(f"Fetched {len(prices)} total price points for {ticker}")
+            return prices
+            
+        except Exception as e:
+            logger.error(f"Error fetching Kalshi prices for {ticker}: {e}")
+            return []
+    
+    def process_polymarket_market(
+        self,
+        condition_id: str,
+        detect_trends: bool = True
+    ) -> Dict[str, List[Signal]]:
+        """
+        Process a single Polymarket market
+        
+        Args:
+            condition_id: Market condition ID
+            detect_trends: Whether to detect trends (default True)
+            
+        Returns:
+            Dict with 'alerts' and 'trends' lists
+        """
+        logger.info(f"Processing Polymarket condition: {condition_id}")
+        
+        prices = self.get_polymarket_prices(condition_id)
+        if not prices:
+            logger.warning(f"No prices found for {condition_id}")
+            return {'alerts': [], 'trends': []}
+        
+        logger.info(f"Found {len(prices)} price points")
+        
+        # Detect alerts (relative changes)
+        alerts = self.detect_signals(prices)
+        for signal in alerts:
+            signal.market_id = condition_id
+            signal.source = 'polymarket'
+            signal.condition_id = condition_id
+        
+        # Detect trends
+        trends = []
+        if detect_trends:
+            trends = self.detect_trends(prices)
+            for signal in trends:
+                signal.market_id = condition_id
+                signal.source = 'polymarket'
+                signal.condition_id = condition_id
+        
+        logger.info(f"Detected {len(alerts)} alerts and {len(trends)} trends")
+        return {'alerts': alerts, 'trends': trends}
+    
+    def process_kalshi_market(
+        self,
+        ticker: str,
+        detect_trends: bool = True
+    ) -> Dict[str, List[Signal]]:
+        """
+        Process a single Kalshi market
+        
+        Args:
+            ticker: Market ticker
+            detect_trends: Whether to detect trends (default True)
+            
+        Returns:
+            Dict with 'alerts' and 'trends' lists
+        """
+        logger.info(f"Processing Kalshi ticker: {ticker}")
+        
+        prices = self.get_kalshi_prices(ticker)
+        if not prices:
+            logger.warning(f"No prices found for {ticker}")
+            return {'alerts': [], 'trends': []}
+        
+        logger.info(f"Found {len(prices)} price points")
+        
+        # Detect alerts (relative changes)
+        alerts = self.detect_signals(prices)
+        for signal in alerts:
+            signal.market_id = ticker
+            signal.source = 'kalshi'
+            signal.ticker = ticker
+        
+        # Detect trends
+        trends = []
+        if detect_trends:
+            trends = self.detect_trends(prices)
+            for signal in trends:
+                signal.market_id = ticker
+                signal.source = 'kalshi'
+                signal.ticker = ticker
+        
+        logger.info(f"Detected {len(alerts)} alerts and {len(trends)} trends")
+        return {'alerts': alerts, 'trends': trends}
+    
+    def get_active_polymarket_conditions(self) -> List[str]:
         """Get list of active Polymarket condition IDs"""
         try:
             response = self.supabase.table('polymarket_tracked_markets')\
@@ -510,261 +394,310 @@ class SignalDetector:
             
             return [m['condition_id'] for m in response.data] if response.data else []
         except Exception as e:
-            logger.error(f"Error fetching active Polymarket markets: {e}")
+            logger.error(f"Error fetching Polymarket markets: {e}")
             return []
     
-    def get_active_kalshi_markets(self) -> List[str]:
+    def get_active_kalshi_tickers(self) -> List[str]:
         """Get list of active Kalshi tickers"""
         try:
-            # Get unique tickers from recent price history
-            response = self.supabase.table('kalshi_price_history')\
+            response = self.supabase.table('kalshi_tracked_markets')\
                 .select('ticker')\
-                .gte('timestamp', (datetime.now(timezone.utc) - timedelta(days=7)).isoformat())\
+                .eq('active', True)\
                 .execute()
             
-            if response.data:
-                tickers = list(set([row['ticker'] for row in response.data]))
-                return tickers
-            return []
+            return [m['ticker'] for m in response.data] if response.data else []
         except Exception as e:
-            logger.error(f"Error fetching active Kalshi markets: {e}")
+            logger.error(f"Error fetching Kalshi markets: {e}")
             return []
     
-    def run_detection_all_markets(
-        self, 
-        lookback_hours: Optional[int] = None,
-        use_all_available: bool = False
-    ) -> Dict[str, Any]:
-        """Run signal detection on all active markets
+    def process_all_markets(self, detect_trends: bool = True) -> Dict[str, Any]:
+        """
+        Process all active markets from both platforms
         
         Args:
-            lookback_hours: Hours to look back (default from config)
-            use_all_available: If True, use all available data when no recent data exists
+            detect_trends: Whether to detect trends in addition to alerts
+            
+        Returns:
+            Processing results and statistics
         """
-        logger.info("Starting signal detection for all markets")
+        logger.info("Processing all active markets")
         
         all_signals = []
         stats = {
-            'polymarket': {'markets': 0, 'signals': 0},
-            'kalshi': {'markets': 0, 'signals': 0}
+            'polymarket': {'markets': 0, 'alerts': 0, 'trends': 0},
+            'kalshi': {'markets': 0, 'alerts': 0, 'trends': 0}
         }
         
-        # Process Polymarket markets
-        poly_markets = self.get_active_polymarket_markets()
-        logger.info(f"Found {len(poly_markets)} Polymarket markets")
+        # Process Polymarket
+        poly_conditions = self.get_active_polymarket_conditions()
+        logger.info(f"Found {len(poly_conditions)} Polymarket markets")
         
-        for condition_id in poly_markets:
+        for condition_id in poly_conditions:
             try:
-                signals = self.detect_polymarket_signals(condition_id, lookback_hours, use_all_available)
-                all_signals.extend(signals)
+                results = self.process_polymarket_market(condition_id, detect_trends)
+                all_signals.extend(results['alerts'])
+                all_signals.extend(results['trends'])
                 stats['polymarket']['markets'] += 1
-                stats['polymarket']['signals'] += len(signals)
+                stats['polymarket']['alerts'] += len(results['alerts'])
+                stats['polymarket']['trends'] += len(results['trends'])
             except Exception as e:
-                logger.error(f"Error processing Polymarket {condition_id}: {e}")
+                logger.error(f"Error processing {condition_id}: {e}")
         
-        # Process Kalshi markets
-        kalshi_tickers = self.get_active_kalshi_markets()
-        logger.info(f"Found {len(kalshi_tickers)} Kalshi tickers")
+        # Process Kalshi
+        kalshi_tickers = self.get_active_kalshi_tickers()
+        logger.info(f"Found {len(kalshi_tickers)} Kalshi markets")
         
         for ticker in kalshi_tickers:
             try:
-                signals = self.detect_kalshi_signals(ticker, lookback_hours, use_all_available)
-                all_signals.extend(signals)
+                results = self.process_kalshi_market(ticker, detect_trends)
+                all_signals.extend(results['alerts'])
+                all_signals.extend(results['trends'])
                 stats['kalshi']['markets'] += 1
-                stats['kalshi']['signals'] += len(signals)
+                stats['kalshi']['alerts'] += len(results['alerts'])
+                stats['kalshi']['trends'] += len(results['trends'])
             except Exception as e:
-                logger.error(f"Error processing Kalshi {ticker}: {e}")
+                logger.error(f"Error processing {ticker}: {e}")
         
-        # Store all signals
+        # Store signals
         stored_count = self.store_signals(all_signals)
         
         return {
-            'status': 'success',
-            'total_signals_detected': len(all_signals),
-            'total_signals_stored': stored_count,
+            'total_signals': len(all_signals),
+            'stored_signals': stored_count,
             'stats': stats,
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
-
-
-    def detect_signals_from_csv(
+    
+    def store_signals(self, signals: List[Signal]) -> int:
+        """Store signals in Supabase"""
+        if not signals:
+            return 0
+        
+        try:
+            records = []
+            for signal in signals:
+                metadata = {
+                    'prior_timestamp': signal.prior_timestamp.isoformat(),
+                    'threshold': self.threshold if signal.signal_type == 'relative_change' else self.trend_threshold
+                }
+                
+                # Add trend-specific metadata
+                if signal.signal_type == 'trend':
+                    metadata['window_size'] = signal.window_size
+                    metadata['stability_points'] = self.trend_stability_points
+                
+                explanation = f"{signal.direction.capitalize()} {abs(signal.percent_change):.1%} change"
+                if signal.signal_type == 'trend':
+                    explanation = f"Sustained {signal.direction} trend: {abs(signal.percent_change):.1%} from {signal.window_size}-point baseline"
+                
+                record = {
+                    'market_id': signal.market_id,
+                    'source': signal.source,
+                    'signal_type': signal.signal_type,
+                    'timestamp': signal.timestamp.isoformat(),
+                    'direction': signal.direction,
+                    'prior_price': float(signal.prior_price),
+                    'new_price': float(signal.new_price),
+                    'price_change': float(signal.new_price - signal.prior_price),
+                    'percent_change': float(signal.percent_change),
+                    'time_window_minutes': int((signal.timestamp - signal.prior_timestamp).total_seconds() / 60),
+                    'explanation': explanation,
+                    'metadata': metadata,
+                    'ticker': signal.ticker,
+                    'condition_id': signal.condition_id
+                }
+                records.append(record)
+            
+            response = self.supabase.table('market_signals')\
+                .upsert(records, on_conflict='market_id,timestamp,signal_type')\
+                .execute()
+            
+            count = len(response.data) if response.data else 0
+            logger.info(f"Stored {count} signals")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error storing signals: {e}")
+            return 0
+    
+    def process_csv(
         self,
         csv_path: str,
         market_id: str,
         source: str,
-        price_column: str = 'price',
-        timestamp_column: str = 'timestamp'
-    ) -> List[Dict[str, Any]]:
-        """Detect signals from a CSV file
+        output_path: Optional[str] = None,
+        detect_trends: bool = True
+    ) -> Dict[str, List[Signal]]:
+        """
+        Process a CSV file and optionally save signals to a CSV
         
         Args:
-            csv_path: Path to CSV file
-            market_id: Market identifier (condition_id for Polymarket, ticker for Kalshi)
+            csv_path: Path to input CSV
+            market_id: Market identifier (ticker or condition_id)
             source: 'polymarket' or 'kalshi'
-            price_column: Name of the price column in CSV
-            timestamp_column: Name of the timestamp column in CSV
+            output_path: Optional path for output CSV (if None, generates one)
+            detect_trends: Whether to detect trends in addition to alerts
         
         Returns:
-            List of detected signals
+            Dict with 'alerts' and 'trends' lists
         """
-        logger.info(f"Analyzing CSV file: {csv_path}")
+        logger.info(f"Processing CSV: {csv_path}")
         
-        # Read CSV and extract price data
+        # Read CSV
         prices = []
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            headers = [h.strip().lower() for h in reader.fieldnames]
+            
+            # Find timestamp and price columns
+            time_col = None
+            price_col = None
+            
+            for col in headers:
+                if col in ['timestamp', 'datetime', 'time', 'date']:
+                    time_col = reader.fieldnames[headers.index(col)]
+                if col in ['price', 'price_close', 'close']:
+                    price_col = reader.fieldnames[headers.index(col)]
+            
+            if not time_col or not price_col:
+                raise ValueError(f"Could not find timestamp or price columns. Found: {reader.fieldnames}")
+            
+            logger.info(f"Using columns: {time_col}, {price_col}")
+            
+            for row in reader:
+                try:
+                    timestamp = datetime.fromisoformat(row[time_col].replace('Z', '+00:00'))
+                    price = float(row[price_col])
+                    
+                    # Convert Kalshi prices if needed
+                    if source == 'kalshi' and price > 1:
+                        price = price / 100.0
+                    
+                    prices.append((timestamp, price))
+                except (ValueError, KeyError) as e:
+                    logger.warning(f"Skipping row: {e}")
+                    continue
         
-        try:
-            with open(csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                
-                # Detect column names (case-insensitive)
-                if reader.fieldnames:
-                    field_map = {k.lower(): k for k in reader.fieldnames}
-                    
-                    # Find price column
-                    price_col = None
-                    for candidate in [price_column.lower(), 'price', 'price_close', 'close']:
-                        if candidate in field_map:
-                            price_col = field_map[candidate]
-                            break
-                    
-                    # Find timestamp column
-                    time_col = None
-                    for candidate in [timestamp_column.lower(), 'timestamp', 'datetime', 'time', 'date']:
-                        if candidate in field_map:
-                            time_col = field_map[candidate]
-                            break
-                    
-                    if not price_col or not time_col:
-                        logger.error(f"Could not find required columns. Available: {reader.fieldnames}")
-                        return []
-                    
-                    logger.info(f"Using columns: timestamp={time_col}, price={price_col}")
-                    
-                    for row in reader:
-                        try:
-                            timestamp_str = row[time_col]
-                            price_str = row[price_col]
-                            
-                            # Parse timestamp
-                            timestamp = date_parser.parse(timestamp_str)
-                            if timestamp.tzinfo is None:
-                                timestamp = timestamp.replace(tzinfo=timezone.utc)
-                            
-                            # Parse price (handle different formats)
-                            price = float(price_str)
-                            
-                            # For Kalshi, prices are in cents, convert to 0-1 scale
-                            if source == 'kalshi' and price > 1:
-                                price = price / 100.0
-                            
-                            prices.append((timestamp, price))
-                        except (ValueError, KeyError) as e:
-                            logger.warning(f"Skipping invalid row: {e}")
-                            continue
-            
-            if len(prices) < 2:
-                logger.warning(f"Insufficient price data in CSV ({len(prices)} rows)")
-                return []
-            
-            # Sort by timestamp
-            prices.sort(key=lambda x: x[0])
-            
-            logger.info(f"Loaded {len(prices)} price points from CSV")
-            
-            # Detect signals across different time windows
-            all_signals = []
-            
-            for window in [self.config.short_window, self.config.medium_window, self.config.long_window, self.config.day_window]:
-                signals = self.detect_signals_in_window(
-                    prices, window, market_id, source
-                )
-                all_signals.extend(signals)
-            
-            # Add appropriate ID field
-            for signal in all_signals:
+        if len(prices) < 2:
+            logger.error("Insufficient data in CSV")
+            return {'alerts': [], 'trends': []}
+        
+        # Sort by timestamp
+        prices.sort(key=lambda x: x[0])
+        logger.info(f"Loaded {len(prices)} price points")
+        
+        # Detect alerts
+        alerts = self.detect_signals(prices)
+        for signal in alerts:
+            signal.market_id = market_id
+            signal.source = source
+            if source == 'kalshi':
+                signal.ticker = market_id
+            else:
+                signal.condition_id = market_id
+        
+        # Detect trends
+        trends = []
+        if detect_trends:
+            trends = self.detect_trends(prices)
+            for signal in trends:
+                signal.market_id = market_id
+                signal.source = source
                 if source == 'kalshi':
-                    signal['ticker'] = market_id
-                    signal['condition_id'] = None
-                else:  # polymarket
-                    signal['condition_id'] = market_id
-                    signal['ticker'] = None
+                    signal.ticker = market_id
+                else:
+                    signal.condition_id = market_id
+        
+        logger.info(f"Detected {len(alerts)} alerts and {len(trends)} trends")
+        
+        # Write output CSV
+        if output_path is None:
+            output_path = csv_path.replace('.csv', '_signals.csv')
+        
+        all_signals = alerts + trends
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'market_id', 'source', 'signal_type', 'timestamp',
+                'direction', 'prior_price', 'new_price', 'price_change',
+                'percent_change', 'time_window_minutes', 'explanation',
+                'prior_timestamp', 'ticker', 'condition_id', 'window_size'
+            ])
             
-            # Deduplicate signals
-            unique_signals = self.deduplicate_signals(all_signals)
-            
-            logger.info(f"Detected {len(unique_signals)} signals from CSV")
-            return unique_signals
-            
-        except Exception as e:
-            logger.error(f"Error processing CSV {csv_path}: {e}", exc_info=True)
-            return []
+            for signal in all_signals:
+                writer.writerow([
+                    signal.market_id,
+                    signal.source,
+                    signal.signal_type,
+                    signal.timestamp.isoformat(),
+                    signal.direction,
+                    f"{signal.prior_price:.6f}",
+                    f"{signal.new_price:.6f}",
+                    f"{signal.new_price - signal.prior_price:.6f}",
+                    f"{signal.percent_change:.4f}",
+                    int((signal.timestamp - signal.prior_timestamp).total_seconds() / 60),
+                    signal.explanation if hasattr(signal, 'explanation') else f"{signal.direction.capitalize()} {abs(signal.percent_change):.1%}",
+                    signal.prior_timestamp.isoformat(),
+                    signal.ticker or '',
+                    signal.condition_id or '',
+                    signal.window_size or ''
+                ])
+        
+        logger.info(f"Saved signals to {output_path}")
+        return {'alerts': alerts, 'trends': trends}
 
 
 def main():
     """Main entry point"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Detect market signals')
-    parser.add_argument('--lookback-hours', type=int, default=24,
-                       help='Hours of historical data to analyze')
-    parser.add_argument('--min-absolute', type=float, default=0.10,
-                       help='Minimum absolute change threshold')
-    parser.add_argument('--min-relative', type=float, default=0.25,
-                       help='Minimum relative change threshold')
+    parser = argparse.ArgumentParser(description='Detect market signals and trends from price changes')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                       help='Relative change threshold for alerts (default: 0.05 = 5%%)')
+    parser.add_argument('--trend-threshold', type=float, default=0.15,
+                       help='Threshold for trend detection (default: 0.15 = 15%%)')
+    parser.add_argument('--trend-window', type=int, default=10,
+                       help='Window size for trend baseline (default: 10)')
+    parser.add_argument('--trend-stability', type=int, default=3,
+                       help='Stability points for trend confirmation (default: 3)')
+    parser.add_argument('--no-trends', action='store_true',
+                       help='Disable trend detection (alerts only)')
     parser.add_argument('--csv', type=str,
-                       help='Path to CSV file to analyze')
+                       help='Path to CSV file')
     parser.add_argument('--market-id', type=str,
                        help='Market ID (required with --csv)')
     parser.add_argument('--source', type=str, choices=['polymarket', 'kalshi'],
                        help='Source platform (required with --csv)')
-    parser.add_argument('--price-column', type=str, default='price',
-                       help='Name of price column in CSV')
-    parser.add_argument('--timestamp-column', type=str, default='timestamp',
-                       help='Name of timestamp column in CSV')
+    parser.add_argument('--output', type=str,
+                       help='Output CSV path (for --csv mode)')
     
     args = parser.parse_args()
     
-    # Create config
-    config = SignalConfig(
-        min_absolute_change=args.min_absolute,
-        min_relative_change=args.min_relative,
-        historical_lookback=args.lookback_hours
+    detector = SignalDetector(
+        threshold_percent=args.threshold,
+        trend_threshold_percent=args.trend_threshold,
+        trend_window_size=args.trend_window,
+        trend_stability_points=args.trend_stability
     )
     
-    detector = SignalDetector(config)
+    detect_trends = not args.no_trends
     
-    # CSV mode
     if args.csv:
         if not args.market_id or not args.source:
-            parser.error("--market-id and --source are required when using --csv")
+            parser.error("--market-id and --source required with --csv")
         
-        signals = detector.detect_signals_from_csv(
-            args.csv,
-            args.market_id,
-            args.source,
-            args.price_column,
-            args.timestamp_column
-        )
-        
-        # Store signals
-        stored = detector.store_signals(signals)
-        
-        results = {
-            'status': 'success',
-            'csv_file': args.csv,
-            'market_id': args.market_id,
-            'source': args.source,
-            'signals_detected': len(signals),
-            'signals_stored': stored,
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }
-        
-        print(json.dumps(results, indent=2))
-    
-    # Database mode
+        results = detector.process_csv(args.csv, args.market_id, args.source, args.output, detect_trends)
+        print(f"Detected {len(results['alerts'])} alerts and {len(results['trends'])} trends")
     else:
-        results = detector.run_detection_all_markets(args.lookback_hours)
-        print(json.dumps(results, indent=2))
+        results = detector.process_all_markets(detect_trends)
+        print(f"Processed {results['stats']['polymarket']['markets']} Polymarket markets")
+        print(f"  - Alerts: {results['stats']['polymarket']['alerts']}")
+        print(f"  - Trends: {results['stats']['polymarket']['trends']}")
+        print(f"Processed {results['stats']['kalshi']['markets']} Kalshi markets")
+        print(f"  - Alerts: {results['stats']['kalshi']['alerts']}")
+        print(f"  - Trends: {results['stats']['kalshi']['trends']}")
+        print(f"Total signals: {results['total_signals']}")
+        print(f"Stored signals: {results['stored_signals']}")
 
 
 if __name__ == '__main__':
